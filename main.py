@@ -3,6 +3,7 @@ from math import inf
 import os
 import numpy as np
 import torch
+import json
 from torch import nn, optim
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
@@ -20,7 +21,8 @@ from utils import lineplot, write_video
 parser = argparse.ArgumentParser(description='PlaNet')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
-parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
+parser.add_argument('--gpu-id', type=int, default=0, help="ID of GPU to use or -1 for CPU")
+
 parser.add_argument('--env', type=str, default='Pendulum-v0', choices=GYM_ENVS + CONTROL_SUITE_ENVS, help='Gym/Control Suite environment')
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
 parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T', help='Max episode length')
@@ -60,20 +62,24 @@ parser.add_argument('--checkpoint-experience', action='store_true', help='Checkp
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+parser.add_argument('--offline', action='store_true')
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
 print(' ' * 26 + 'Options')
 for k, v in vars(args).items():
   print(' ' * 26 + k + ': ' + str(v))
 
+# torch.set_num_threads(1)
 
 # Setup
-results_dir = os.path.join('results', args.id)
+results_dir = os.path.join('/data/ashwin/planet', args.id)
 os.makedirs(results_dir, exist_ok=True)
+with open(os.path.join(results_dir, 'args.json'), 'w') as f:
+  json.dump(vars(args), f, sort_keys=True, indent=2)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
-if torch.cuda.is_available() and not args.disable_cuda:
-  args.device = torch.device('cuda')
+if args.gpu_id != -1:
+  args.device = torch.device(f'cuda:{args.gpu_id}')
   torch.cuda.manual_seed(args.seed)
 else:
   args.device = torch.device('cpu')
@@ -83,7 +89,9 @@ metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': []
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
 if args.experience_replay is not '' and os.path.exists(args.experience_replay):
+  print(f"Using replay buffer at {args.experience_replay}")
   D = torch.load(args.experience_replay)
+  D.device = args.device
   metrics['steps'], metrics['episodes'] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
 elif not args.test:
   D = ExperienceReplay(args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device)
@@ -163,6 +171,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   for s in tqdm(range(args.collect_interval)):
     # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
     observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+    observations = observations[:, :, -3:] # Take only the latest frame of the stack
     # Create initial belief and state for time t = 0
     init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
@@ -213,28 +222,29 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
 
-
-  # Data collection
-  with torch.no_grad():
-    observation, total_reward = env.reset(), 0
-    belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
-    pbar = tqdm(range(args.max_episode_length // args.action_repeat))
-    for t in pbar:
-      belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
-      D.append(observation, action.cpu(), reward, done)
-      total_reward += reward
-      observation = next_observation
-      if args.render:
-        env.render()
-      if done:
-        pbar.close()
-        break
-    
-    # Update and plot train reward metrics
-    metrics['steps'].append(t + metrics['steps'][-1])
-    metrics['episodes'].append(episode)
-    metrics['train_rewards'].append(total_reward)
-    lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
+  metrics['episodes'].append(episode)
+  
+  if not args.offline:
+    # Data collection
+    with torch.no_grad():
+      observation, total_reward = env.reset(), 0
+      belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
+      pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+      for t in pbar:
+        belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
+        D.append(observation, action.cpu(), reward, done)
+        total_reward += reward
+        observation = next_observation
+        if args.render:
+          env.render()
+        if done:
+          pbar.close()
+          break
+      
+      # Update and plot train reward metrics
+      metrics['steps'].append(t + metrics['steps'][-1])
+      metrics['train_rewards'].append(total_reward)
+      lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
 
 
   # Test model
@@ -265,7 +275,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     metrics['test_episodes'].append(episode)
     metrics['test_rewards'].append(total_rewards.tolist())
     lineplot(metrics['test_episodes'], metrics['test_rewards'], 'test_rewards', results_dir)
-    lineplot(np.asarray(metrics['steps'])[np.asarray(metrics['test_episodes']) - 1], metrics['test_rewards'], 'test_rewards_steps', results_dir, xaxis='step')
+    # lineplot(np.asarray(metrics['steps'])[np.asarray(metrics['test_episodes']) - 1], metrics['test_rewards'], 'test_rewards_steps', results_dir, xaxis='step')
     if not args.symbolic_env:
       episode_str = str(episode).zfill(len(str(args.episodes)))
       write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
